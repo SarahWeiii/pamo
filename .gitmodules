@@ -1,0 +1,3 @@
+[submodule "simp_cuda/safe_project/warp_"]
+	path = simp_cuda/safe_project/warp_
+	url = https://github.com/Rabbit-Hu/warp.git
