@@ -14,9 +14,10 @@ Our approach is highly efficient, simplifying a 2-million-face mesh to 20k trian
 ## Installation
 ### Option 1: Docker environment
 ```
-docker run --name pamo -i -t --gpus all -e NVIDIA_DRIVER_CAPABILITIES=graphics,compute,utility sarahwei0210/pamo:0.0.1 /bin/bash
-bash install_pamo.sh
+docker run --name pamo -i -t --gpus all -e NVIDIA_DRIVER_CAPABILITIES=graphics,compute,utility sarahwei0210/pamo:0.0.2 /bin/bash
 ```
+PaMO environment is ready under `/workspace/pamo`
+
 ### Option 2: Install by anaconda (may take ~5min)
 ```
 git clone --recurse-submodules https://github.com/SarahWeiii/pamo.git

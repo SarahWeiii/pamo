@@ -40,3 +40,37 @@ RUN pip install --upgrade pip \
 
 # Set environment variables
 ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6
+
+# Clone PaMO repository
+RUN git clone --recurse-submodules https://github.com/SarahWeiii/pamo.git /workspace/pamo
+
+# Set work directory to PaMO
+WORKDIR /workspace/pamo
+
+# Install PaMO components
+RUN echo "Installing stage 2: simplification..." \
+    && cd simp_cuda \
+    && pip install .
+
+RUN echo "Installing stage 3: safe projection..." \
+    && cd simp_cuda/safe_project/warp_ \
+    && chmod +x ./tools/packman/packman \
+    && python build_lib.py --cuda_path /usr/local/cuda \
+    && pip install . \
+    && cd .. \
+    && pip install . \
+    && cd ../..
+
+# Set the default working directory to PaMO
+WORKDIR /workspace/pamo
+
+# Create a simple entry point script
+RUN echo '#!/bin/bash\n\
+echo "PaMO environment is ready!"\n\
+echo "You can now run: python example.py --input INPUT_DIR --output OUTPUT_DIR --ratio 0.001"\n\
+echo "Or use the demo: bash demo.sh"\n\
+exec "$@"' > /entrypoint.sh \
+    && chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["/bin/bash"]
