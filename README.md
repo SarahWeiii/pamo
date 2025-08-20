@@ -31,7 +31,7 @@ bash setup.sh
 ```
 bash demo.sh
 ```
-We offer three meshes stored under `./mesh` folder for the demo. The results will be saved under `./examples` folder.
+We offer three meshes stored under `./mesh` folder (from [DTC dataset](https://ai.meta.com/blog/digital-twin-catalog-3d-reconstruction-shopify-reality-labs-research/)) for the demo. The results will be saved under `./examples` folder.
 
 ## Example
 ```
