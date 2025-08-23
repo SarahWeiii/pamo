@@ -1,5 +1,4 @@
-# Parallel Mesh Optimization (PaMO)
-PaMO: Parallel Mesh Optimization for Intersection-Free Low-Poly Modeling on the GPU [PG2025]
+# PaMO: Parallel Mesh Optimization for Intersection-Free Low-Poly Modeling on the GPU [PG2025]
 
 *Seonghun Oh\*, Xiaodi Yuan\*, Xinyue Wei\*, Ruoxi Shi, Fanbo Xiang, Minghua Liu, Hao Su*
 <br>[[Project Page]](https://seonghunn.github.io/pamo/)
