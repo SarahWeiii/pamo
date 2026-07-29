@@ -81,6 +81,8 @@ namespace cusimp_free
             CHECK_CUDA(cudaFree(vertices_invalid_table));
             CHECK_CUDA(
                 cudaMalloc((void **)&vertices_invalid_table, (allocated_pts + 1) * sizeof(bool)));
+            // cudaMalloc is not zero-fill; dirty bits block edge collapses.
+            CHECK_CUDA(cudaMemset(vertices_invalid_table, 0, (allocated_pts + 1) * sizeof(bool)));
         }
     }
 
@@ -98,6 +100,9 @@ namespace cusimp_free
             CHECK_CUDA(
                 cudaMalloc((void **)&original_tris, (allocated_tris + 1) * sizeof(Triangle<int>)));
 
+            // free before capacity growth; previous allocation would leak
+            CHECK_CUDA(cudaFree(intersected_triangle_idx));
+            intersected_triangle_idx = nullptr;
             CHECK_CUDA(cudaMalloc((void **)&intersected_triangle_idx, 2 * (allocated_tris + 1) * sizeof(unsigned int)));
             
             // memory for bvh construction and self intersection check
@@ -895,24 +900,13 @@ namespace cusimp_free
         n_vertices_undo = 0;
         n_invalid_vertices = 0;
         int first_n_vertices_undo = 0;
-        // if is stuck, accumulate the invalid list
+        // if is stuck, accumulate the invalid list (needs buffers from a prior
+        // forward; first call always starts with is_stuck=false).
         if(is_stuck){
             cudaMemcpy(tmp_vertices_undo_list, verts_undo, n_verts_undo * sizeof(int), cudaMemcpyDeviceToDevice);
             n_vertices_undo += n_verts_undo;
             rearrange_index_of_undo_vertices<<<(n_vertices_undo + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this, first_n_vertices_undo);
             first_n_vertices_undo += n_verts_undo;
-        }
-        else{
-            if(n_verts_undo != 0)
-                CHECK_CUDA(cudaMemset(vertices_invalid_table, 0, (allocated_pts + 1) * sizeof(bool)));
-        }
-
-        if (n_verts_undo != 0)
-        {
-            // not stuck, set vertics_invalid_table as all 0
-            cudaMemcpy(vertices_invalid_list, verts_undo, n_verts_undo * sizeof(int), cudaMemcpyDeviceToDevice);
-            n_invalid_vertices = n_verts_undo;
-            compute_invalid_vertices_table<<<(n_invalid_vertices + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
         }
 
         int first_n_edges_undo_init_val = first_n_vertices_undo;
@@ -926,14 +920,29 @@ namespace cusimp_free
         resize(nPts, nTris);
 
         ensure_pts_storage_size(n_pts);
+        // pts/tris are torch CUDA tensors — must be D2D (H2D reads device ptrs as host).
         CHECK_CUDA(cudaMemcpy(points, pts, n_pts * sizeof(Vertex<float>),
-                              cudaMemcpyHostToDevice));
+                              cudaMemcpyDeviceToDevice));
         std::vector<int> tmp(n_pts, 1);
         CHECK_CUDA(cudaMemcpy(pts_occ, tmp.data(), n_pts * sizeof(int), cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemset(pts_occ + n_pts, 0, sizeof(int)));
         ensure_tris_storage_size(n_tris);
         CHECK_CUDA(cudaMemcpy(triangles, tris, n_tris * sizeof(Triangle<int>),
-                              cudaMemcpyHostToDevice));
+                              cudaMemcpyDeviceToDevice));
+
+        // Invalid-mask init must run *after* ensure_pts (table may be newly malloc'd).
+        // When not stuck, clear every forward so recycled dirty memory cannot mark
+        // random verts invalid and stall collapse (multi-run no-op / ~remesh face count).
+        // When stuck, keep accumulated bits and only OR in the new undo verts below.
+        if (!is_stuck) {
+            CHECK_CUDA(cudaMemset(vertices_invalid_table, 0, (allocated_pts + 1) * sizeof(bool)));
+        }
+        if (n_verts_undo != 0) {
+            cudaMemcpy(vertices_invalid_list, verts_undo, n_verts_undo * sizeof(int), cudaMemcpyDeviceToDevice);
+            n_invalid_vertices = n_verts_undo;
+            compute_invalid_vertices_table<<<(n_invalid_vertices + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
+        }
+
         if (init){
             thrust::device_ptr<Triangle<int>> thrust_triangles(triangles);
             thrust::default_random_engine rng;
@@ -981,69 +990,100 @@ namespace cusimp_free
         ensure_vert_Q_storage_size(n_pts);
         compute_vert_Q_kernel<<<(n_pts + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
 
-        ensure_edge_cost_storage_size(n_edges);
-        compute_edge_cost_kernel<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this, is_stuck);
-        CHECK_CUDA(cudaMemcpy(original_edge_cost, edge_cost, n_edges * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
-
-        // cost propagate
-        ensure_tri_min_cost_storage_size(n_tris);
-        std::vector<uint64_cu> temp(n_tris, std::numeric_limits<uint64_cu>::max());
-        CHECK_CUDA(cudaMemcpy(tri_min_cost, temp.data(), n_tris * sizeof(uint64_cu), cudaMemcpyHostToDevice));
-        propagate_edge_cost_kernel<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
-
-        // collapsed edge
+        // free before re-malloc: previous forward() left these allocated (only
+        // n_intersect was freed), leaking collapsed_edge_idx (~O(n_edges) per
+        // call) across multi-iteration runs
+        CHECK_CUDA(cudaFree(n_collapsed));
+        n_collapsed = nullptr;
         CHECK_CUDA(cudaMalloc((void **)&n_collapsed, sizeof(int)));
         CHECK_CUDA(cudaMemset(n_collapsed, 0, sizeof(int)));
-        CHECK_CUDA(cudaMalloc((void **)&collapsed_edge_idx, n_edges * sizeof(int)));
-        CHECK_CUDA(cudaMemset(collapsed_edge_idx, 0, n_edges * sizeof(int)));
-        collapse_edge_kernel<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
+        CHECK_CUDA(cudaFree(collapsed_edge_idx));
+        collapsed_edge_idx = nullptr;
+
+        // Full edge-dependent section: cost, propagate, collapse, cleanup.
+        // Avoid zero-block kernel launches and zero-sized edge buffers.
+        if (n_edges > 0) {
+            ensure_edge_cost_storage_size(n_edges);
+            // Cost kernel leaves many edges unwritten (early return on topology /
+            // is_stuck). Default to max so dirty recycled buffers cannot look like
+            // free collapses — or, after free/realloc, like all-blocked costs.
+            CHECK_CUDA(cudaMemset(edge_cost, 0xFF, n_edges * sizeof(uint32_t)));
+            compute_edge_cost_kernel<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this, is_stuck);
+            CHECK_CUDA(cudaMemcpy(original_edge_cost, edge_cost, n_edges * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+
+            // cost propagate
+            ensure_tri_min_cost_storage_size(n_tris);
+            std::vector<uint64_cu> temp(n_tris, std::numeric_limits<uint64_cu>::max());
+            CHECK_CUDA(cudaMemcpy(tri_min_cost, temp.data(), n_tris * sizeof(uint64_cu), cudaMemcpyHostToDevice));
+            propagate_edge_cost_kernel<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
+
+            CHECK_CUDA(cudaMalloc((void **)&collapsed_edge_idx, n_edges * sizeof(int)));
+            CHECK_CUDA(cudaMemset(collapsed_edge_idx, 0, n_edges * sizeof(int)));
+            collapse_edge_kernel<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
+        }
 
         // check num_collapsed-----------
-        cudaMalloc((void **)&n_intersect, sizeof(unsigned int));
+        CHECK_CUDA(cudaFree(n_intersect));
+        n_intersect = nullptr;
+        CHECK_CUDA(cudaMalloc((void **)&n_intersect, sizeof(unsigned int)));
 
         int h_n_collapsed = 0;
+        CHECK_CUDA(cudaFree(n_edges_undo));
+        n_edges_undo = nullptr;
         CHECK_CUDA(cudaMalloc(&n_edges_undo, sizeof(int)));
         CHECK_CUDA(cudaMemset(n_edges_undo, 0, sizeof(int)));
         CHECK_CUDA(cudaMemcpy(&h_n_collapsed, n_collapsed, sizeof(int), cudaMemcpyDeviceToHost));
-        CHECK_CUDA(cudaMalloc(&edges_undo, 2 * h_n_collapsed * sizeof(int)));
-        CHECK_CUDA(cudaMemset(edges_undo, 0, 2 * h_n_collapsed * sizeof(int)));
+        CHECK_CUDA(cudaFree(edges_undo));
+        edges_undo = nullptr;
+        // Guard zero-sized allocation when no edges collapsed
+        if (h_n_collapsed > 0) {
+            CHECK_CUDA(cudaMalloc(&edges_undo, 2 * (size_t)h_n_collapsed * sizeof(int)));
+            CHECK_CUDA(cudaMemset(edges_undo, 0, 2 * (size_t)h_n_collapsed * sizeof(int)));
+        }
 
         remove_invalid_faces<<<(n_tris + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
-        remove_line_edge_collapse<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
-        // self intersection check after collapse
-        bool isIntersect = selfx::self_intersect(this, n_pts, n_tris, epsilon);
-        CHECK_CUDA(cudaMemset(n_edges_undo, 0, sizeof(int)));
-        get_undo_candidate_kernel<<<(h_n_collapsed + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
-        cudaDeviceSynchronize();
-
-        // get number of edges undo
-        int h_n_edges_undo = 0;
-        cudaMemcpy(&h_n_edges_undo, n_edges_undo, sizeof(int), cudaMemcpyDeviceToHost);
-        n_vertices_undo += 2 * h_n_edges_undo;
-        int i = 0;
-        while(h_n_edges_undo != 0){
-            i++;
-            undo_collapse_kernel<<<(h_n_collapsed + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
-            rearrange_index_of_undo_vertices<<<(n_vertices_undo + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this, first_n_vertices_undo);
-            cudaDeviceSynchronize();
-            first_n_vertices_undo += 2 * h_n_edges_undo;
-
-            bool afterUndo = selfx::self_intersect(this, n_pts, n_tris, epsilon);
-            cudaDeviceSynchronize();
+        if (n_edges > 0) {
+            remove_line_edge_collapse<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
+        }
+        // self-intersection / undo only when edges actually collapsed (avoids
+        // launching get_undo_candidate_kernel with a zero-sized grid)
+        if (h_n_collapsed > 0) {
+            bool isIntersect = selfx::self_intersect(this, n_pts, n_tris, epsilon);
             CHECK_CUDA(cudaMemset(n_edges_undo, 0, sizeof(int)));
             get_undo_candidate_kernel<<<(h_n_collapsed + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
             cudaDeviceSynchronize();
+
+            // get number of edges undo
+            int h_n_edges_undo = 0;
             cudaMemcpy(&h_n_edges_undo, n_edges_undo, sizeof(int), cudaMemcpyDeviceToHost);
             n_vertices_undo += 2 * h_n_edges_undo;
+            int i = 0;
+            while(h_n_edges_undo != 0){
+                i++;
+                undo_collapse_kernel<<<(h_n_collapsed + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
+                rearrange_index_of_undo_vertices<<<(n_vertices_undo + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this, first_n_vertices_undo);
+                cudaDeviceSynchronize();
+                first_n_vertices_undo += 2 * h_n_edges_undo;
 
-            if(i == 5) break;
+                bool afterUndo = selfx::self_intersect(this, n_pts, n_tris, epsilon);
+                cudaDeviceSynchronize();
+                CHECK_CUDA(cudaMemset(n_edges_undo, 0, sizeof(int)));
+                get_undo_candidate_kernel<<<(h_n_collapsed + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
+                cudaDeviceSynchronize();
+                cudaMemcpy(&h_n_edges_undo, n_edges_undo, sizeof(int), cudaMemcpyDeviceToHost);
+                n_vertices_undo += 2 * h_n_edges_undo;
+
+                if(i == 5) break;
+            }
         }
 
+        // final vertex compaction (runs even when nothing collapsed)
         CHECK_CUDA(cudaMemcpy(pts_map, pts_occ, (n_pts + 1) * sizeof(int), cudaMemcpyDeviceToDevice));
         cub::DeviceScan::ExclusiveSum(nullptr, temp_storage_bytes, pts_map, pts_map, n_pts + 1);
         ensure_temp_storage_size(temp_storage_bytes);
         cub::DeviceScan::ExclusiveSum(temp_storage, allocated_temp_storage_size, pts_map, pts_map, n_pts + 1);
 
         CHECK_CUDA(cudaFree(n_intersect));
+        n_intersect = nullptr;
     }
 }

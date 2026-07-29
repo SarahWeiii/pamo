@@ -17,35 +17,44 @@ namespace cusimp_free
   {
     CUSimp_Free pamo;
 
+    void release()
+    {
+      cudaDeviceSynchronize();
+      // cudaFree(nullptr) is a no-op; free every owned buffer once and null
+      // so a double-free path cannot use a stale pointer.
+      cudaFree(pamo.temp_storage); pamo.temp_storage = nullptr;
+      cudaFree(pamo.first_near_tris); pamo.first_near_tris = nullptr;
+      cudaFree(pamo.near_tris); pamo.near_tris = nullptr;
+      cudaFree(pamo.near_offset); pamo.near_offset = nullptr;
+      cudaFree(pamo.first_edge); pamo.first_edge = nullptr;
+      cudaFree(pamo.edges); pamo.edges = nullptr;
+      cudaFree(pamo.vert_Q); pamo.vert_Q = nullptr;
+      cudaFree(pamo.edge_cost); pamo.edge_cost = nullptr;
+      cudaFree(pamo.tri_min_cost); pamo.tri_min_cost = nullptr;
+      cudaFree(pamo.points); pamo.points = nullptr;
+      cudaFree(pamo.pts_occ); pamo.pts_occ = nullptr;
+      cudaFree(pamo.pts_map); pamo.pts_map = nullptr;
+      cudaFree(pamo.triangles); pamo.triangles = nullptr;
+      cudaFree(pamo.n_collapsed); pamo.n_collapsed = nullptr;
+      cudaFree(pamo.original_points); pamo.original_points = nullptr;
+      cudaFree(pamo.original_tris); pamo.original_tris = nullptr;
+      cudaFree(pamo.original_edge_cost); pamo.original_edge_cost = nullptr;
+      cudaFree(pamo.collapsed_edge_idx); pamo.collapsed_edge_idx = nullptr;
+      cudaFree(pamo.n_edges_undo); pamo.n_edges_undo = nullptr;
+      cudaFree(pamo.edges_undo); pamo.edges_undo = nullptr;
+      cudaFree(pamo.vertices_undo_list); pamo.vertices_undo_list = nullptr;
+      cudaFree(pamo.tmp_vertices_undo_list); pamo.tmp_vertices_undo_list = nullptr;
+      cudaFree(pamo.vertices_invalid_list); pamo.vertices_invalid_list = nullptr;
+      cudaFree(pamo.vertices_invalid_table); pamo.vertices_invalid_table = nullptr;
+      cudaFree(pamo.query_triangle_list); pamo.query_triangle_list = nullptr;
+      cudaFree(pamo.intersected_triangle_idx); pamo.intersected_triangle_idx = nullptr;
+      cudaFree(pamo.n_intersect); pamo.n_intersect = nullptr;
+    }
+
 public:
     ~CUDSP_Free()
     {
-      cudaDeviceSynchronize();
-      cudaFree(pamo.temp_storage);
-      cudaFree(pamo.first_near_tris);
-      cudaFree(pamo.near_tris);
-      cudaFree(pamo.near_offset);
-      cudaFree(pamo.first_edge);
-      cudaFree(pamo.edges);
-      cudaFree(pamo.vert_Q);
-      cudaFree(pamo.edge_cost);
-      cudaFree(pamo.tri_min_cost);
-      cudaFree(pamo.points);
-      cudaFree(pamo.triangles);
-      cudaFree(pamo.n_collapsed);
-      cudaFree(pamo.original_points);
-      cudaFree(pamo.original_tris);
-      cudaFree(pamo.original_edge_cost);
-      cudaFree(pamo.collapsed_edge_idx);
-      cudaFree(pamo.n_edges_undo);
-      cudaFree(pamo.edges_undo);
-      cudaFree(pamo.vertices_undo_list);
-      cudaFree(pamo.tmp_vertices_undo_list);
-      cudaFree(pamo.vertices_invalid_list);
-      cudaFree(pamo.vertices_invalid_table);
-      cudaFree(pamo.query_triangle_list);
-      cudaFree(pamo.intersected_triangle_idx);
-      cudaFree(pamo.n_intersect);
+      release();
     }
 
     //std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> forward(torch::Tensor points, torch::Tensor triangles, int iter, float scale, float epsilon, float threshold)
@@ -120,21 +129,28 @@ namespace cusimp
   {
     CUSimp sp;
 
+    void release()
+    {
+      cudaDeviceSynchronize();
+      cudaFree(sp.temp_storage); sp.temp_storage = nullptr;
+      cudaFree(sp.first_near_tris); sp.first_near_tris = nullptr;
+      cudaFree(sp.near_tris); sp.near_tris = nullptr;
+      cudaFree(sp.near_offset); sp.near_offset = nullptr;
+      cudaFree(sp.first_edge); sp.first_edge = nullptr;
+      cudaFree(sp.edges); sp.edges = nullptr;
+      cudaFree(sp.vert_Q); sp.vert_Q = nullptr;
+      cudaFree(sp.edge_cost); sp.edge_cost = nullptr;
+      cudaFree(sp.tri_min_cost); sp.tri_min_cost = nullptr;
+      cudaFree(sp.points); sp.points = nullptr;
+      cudaFree(sp.pts_occ); sp.pts_occ = nullptr;
+      cudaFree(sp.pts_map); sp.pts_map = nullptr;
+      cudaFree(sp.triangles); sp.triangles = nullptr;
+    }
+
 public:
     ~CUDSP()
     {
-      cudaDeviceSynchronize();
-      cudaFree(sp.temp_storage);
-      cudaFree(sp.first_near_tris);
-      cudaFree(sp.near_tris);
-      cudaFree(sp.near_offset);
-      cudaFree(sp.first_edge);
-      cudaFree(sp.edges);
-      cudaFree(sp.vert_Q);
-      cudaFree(sp.edge_cost);
-      cudaFree(sp.tri_min_cost);
-      cudaFree(sp.points);
-      cudaFree(sp.triangles);
+      release();
     }
 
     std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> forward(torch::Tensor points, torch::Tensor triangles, float scale, float threshold, bool init)
