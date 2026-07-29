@@ -81,6 +81,8 @@ namespace cusimp_free
             CHECK_CUDA(cudaFree(vertices_invalid_table));
             CHECK_CUDA(
                 cudaMalloc((void **)&vertices_invalid_table, (allocated_pts + 1) * sizeof(bool)));
+            // cudaMalloc is not zero-fill; dirty bits block edge collapses.
+            CHECK_CUDA(cudaMemset(vertices_invalid_table, 0, (allocated_pts + 1) * sizeof(bool)));
         }
     }
 
@@ -898,24 +900,13 @@ namespace cusimp_free
         n_vertices_undo = 0;
         n_invalid_vertices = 0;
         int first_n_vertices_undo = 0;
-        // if is stuck, accumulate the invalid list
+        // if is stuck, accumulate the invalid list (needs buffers from a prior
+        // forward; first call always starts with is_stuck=false).
         if(is_stuck){
             cudaMemcpy(tmp_vertices_undo_list, verts_undo, n_verts_undo * sizeof(int), cudaMemcpyDeviceToDevice);
             n_vertices_undo += n_verts_undo;
             rearrange_index_of_undo_vertices<<<(n_vertices_undo + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this, first_n_vertices_undo);
             first_n_vertices_undo += n_verts_undo;
-        }
-        else{
-            if(n_verts_undo != 0)
-                CHECK_CUDA(cudaMemset(vertices_invalid_table, 0, (allocated_pts + 1) * sizeof(bool)));
-        }
-
-        if (n_verts_undo != 0)
-        {
-            // not stuck, set vertics_invalid_table as all 0
-            cudaMemcpy(vertices_invalid_list, verts_undo, n_verts_undo * sizeof(int), cudaMemcpyDeviceToDevice);
-            n_invalid_vertices = n_verts_undo;
-            compute_invalid_vertices_table<<<(n_invalid_vertices + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
         }
 
         int first_n_edges_undo_init_val = first_n_vertices_undo;
@@ -929,14 +920,29 @@ namespace cusimp_free
         resize(nPts, nTris);
 
         ensure_pts_storage_size(n_pts);
+        // pts/tris are torch CUDA tensors — must be D2D (H2D reads device ptrs as host).
         CHECK_CUDA(cudaMemcpy(points, pts, n_pts * sizeof(Vertex<float>),
-                              cudaMemcpyHostToDevice));
+                              cudaMemcpyDeviceToDevice));
         std::vector<int> tmp(n_pts, 1);
         CHECK_CUDA(cudaMemcpy(pts_occ, tmp.data(), n_pts * sizeof(int), cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemset(pts_occ + n_pts, 0, sizeof(int)));
         ensure_tris_storage_size(n_tris);
         CHECK_CUDA(cudaMemcpy(triangles, tris, n_tris * sizeof(Triangle<int>),
-                              cudaMemcpyHostToDevice));
+                              cudaMemcpyDeviceToDevice));
+
+        // Invalid-mask init must run *after* ensure_pts (table may be newly malloc'd).
+        // When not stuck, clear every forward so recycled dirty memory cannot mark
+        // random verts invalid and stall collapse (multi-run no-op / ~remesh face count).
+        // When stuck, keep accumulated bits and only OR in the new undo verts below.
+        if (!is_stuck) {
+            CHECK_CUDA(cudaMemset(vertices_invalid_table, 0, (allocated_pts + 1) * sizeof(bool)));
+        }
+        if (n_verts_undo != 0) {
+            cudaMemcpy(vertices_invalid_list, verts_undo, n_verts_undo * sizeof(int), cudaMemcpyDeviceToDevice);
+            n_invalid_vertices = n_verts_undo;
+            compute_invalid_vertices_table<<<(n_invalid_vertices + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this);
+        }
+
         if (init){
             thrust::device_ptr<Triangle<int>> thrust_triangles(triangles);
             thrust::default_random_engine rng;
@@ -998,6 +1004,10 @@ namespace cusimp_free
         // Avoid zero-block kernel launches and zero-sized edge buffers.
         if (n_edges > 0) {
             ensure_edge_cost_storage_size(n_edges);
+            // Cost kernel leaves many edges unwritten (early return on topology /
+            // is_stuck). Default to max so dirty recycled buffers cannot look like
+            // free collapses — or, after free/realloc, like all-blocked costs.
+            CHECK_CUDA(cudaMemset(edge_cost, 0xFF, n_edges * sizeof(uint32_t)));
             compute_edge_cost_kernel<<<(n_edges + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(*this, is_stuck);
             CHECK_CUDA(cudaMemcpy(original_edge_cost, edge_cost, n_edges * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
 
