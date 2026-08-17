@@ -215,7 +215,7 @@ def ee_distance_grad_struct(x0: wp.vec3, x1: wp.vec3, x2: wp.vec3, x3: wp.vec3) 
     t128 = (t40 * t65 * t90 * t93) / 2.0
     t129 = (t39 * t66 * t90 * t93) / 2.0
     t130 = (t38 * t67 * t90 * t93) / 2.0
-    t133 = wp.select(t132 < 0.0, 1.0, -1.0)
+    t133 = wp.where(t132 < 0.0, -1.0, 1.0)
     t127 = -t116
     t131 = -t122
 
@@ -335,7 +335,7 @@ def pt_distance_grad_struct(x0: wp.vec3, x1: wp.vec3, x2: wp.vec3, x3: wp.vec3) 
     t73 = t11 * t34 * t69
     t74 = -t72
     t75 = t71 + t73 + t74
-    t76 = wp.select(t75 < 0.0, 1.0, -1.0)
+    t76 = wp.where(t75 < 0.0, -1.0, 1.0)
 
     return Dd_dx(
         wp.vec3(t34 * t69 * t76, -t33 * t69 * t76, t32 * t69 * t76),
