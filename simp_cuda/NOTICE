@@ -1,0 +1,34 @@
+PaMO internal research build
+===============================================
+
+This combined binary distribution contains or derives from:
+
+* PaMO, commit a10e34351eb7de71f41eb279e7ab9b2b101cf7a4, AGPL-3.0-only:
+  https://github.com/SarahWeiii/pamo
+* PDMC, commit 54406314bb9870c2c1b3c2badfde3f6d01f1e499, declared by its
+  package metadata as CC BY-NC 4.0:
+  https://github.com/seonghunn/pdmc
+* cuMesh2SDF, commit 7789ade81bcd5fa77112d2cb5d825ed0e634e76b,
+  Apache-2.0:
+  https://github.com/eliphatfs/cumesh2sdf
+* NVIDIA CUDA helper_math.h, Copyright (c) 2022 NVIDIA CORPORATION,
+  BSD-3-Clause. Its full notice is bundled in
+  licenses/NVIDIA-helper_math-BSD-3-Clause.txt.
+* The Jacobi eigensolver used by the Stage 3 positive-semidefinite projection,
+  attributed upstream to John Burkardt and distributed under the GNU LGPL.
+
+This build targets Python 3.10, 3.11, and 3.12, PyTorch 2.2 or newer with
+CUDA 12, warp-lang 1.16 or newer, and NVIDIA GPUs of compute capability 8.0
+or newer. Each binary wheel is tagged with the PyTorch minor version and
+CUDA runtime it was compiled against, for example
+`pamo-0.1.0+torch2.7.cu126`. This wheel is restricted to internal,
+non-commercial research use by project policy and the PDMC license.
+
+The exact source and build metadata corresponding to this binary is included
+inside the wheel at:
+
+  share/pamo/corresponding-source/
+
+The archive contains the local compatibility changes and all native sources
+needed to rebuild the three CUDA extensions. No external publication is
+required to retrieve the corresponding source.
