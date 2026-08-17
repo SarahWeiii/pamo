@@ -30,6 +30,7 @@ def process(
     config: Stage3Config = None,
     eval=False,
     return_curve=False,
+    device="cuda",
 ):      
     """
     Reuse system if provided, otherwise create a new one with the given
@@ -43,7 +44,7 @@ def process(
         gc.collect()
         if config is None:
             config = Stage3Config()
-        system = Stage3System(config, "cuda:0")
+        system = Stage3System(config, device)
     else:
         system.clear()
 

@@ -1,0 +1,33 @@
+[build-system]
+requires = [
+  "packaging>=24.2",
+  "setuptools>=77,<81",
+  "torch>=2.2",
+  "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pamo"
+dynamic = ["version", "dependencies"]
+description = "PaMO research build for CUDA 12 NVIDIA GPUs"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = "AGPL-3.0-only AND CC-BY-NC-4.0 AND Apache-2.0 AND LGPL-3.0-or-later AND BSD-3-Clause"
+license-files = ["NOTICE", "licenses/*"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: GPU :: NVIDIA CUDA",
+  "Environment :: GPU :: NVIDIA CUDA :: 12",
+  "Intended Audience :: Science/Research",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/SarahWeiii/pamo"
+
+[tool.uv]
+package = true

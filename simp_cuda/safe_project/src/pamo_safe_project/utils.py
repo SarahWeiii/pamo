@@ -13,20 +13,11 @@ mat22 = wp.types.matrix(shape=(2, 2), dtype=wp.float32)
 
 
 def wp_slice(a: wp.array, start, end):
-    """Utility function to slice a warp array along the first dimension
-    """
+    """Return a zero-copy first-dimension view using Warp 1.16+ slicing."""
 
     assert a.is_contiguous
     assert 0 <= start <= end <= a.shape[0]
-    return wp.array(
-        ptr=a.ptr + start * a.strides[0],
-        dtype=a.dtype,
-        shape=(end - start, *a.shape[1:]),
-        strides=a.strides,
-        device=a.device,
-        copy=False,
-        owner=False,
-    )
+    return a[start:end]
     
 
 def convert_to_wp_array(
@@ -83,4 +74,3 @@ stage3_logger.setLevel(logging.INFO)
 stage3_logger.handlers.clear()
 stage3_logger.propagate = False
 stage3_logger.addHandler(console_handler)
-

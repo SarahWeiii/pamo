@@ -1,5 +1,7 @@
 import warp as wp
 
+from .spd_project import project_spd_blocks
+
 
 @wp.kernel
 def a_plus_k_b_kernel(
@@ -24,9 +26,9 @@ def block_spd_project_kernel(
 ):
     bid = wp.tid()
 
-    block = blocks[bid]
+    project_spd_blocks(blocks, bid, it_max)
 
-    wp.spd_project_blocks(3, block, it_max)
+    block = blocks[bid]
 
     block[3][0] = -block[0][0] - block[1][0] - block[2][0]
     block[3][1] = -block[0][1] - block[1][1] - block[2][1]

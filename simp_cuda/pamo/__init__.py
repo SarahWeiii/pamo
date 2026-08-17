@@ -1,227 +1,386 @@
-import os
+"""PaMO's three-stage GPU mesh optimization pipeline."""
+
+from __future__ import annotations
+
 import copy
+import time
+from importlib.metadata import PackageNotFoundError, version
+from typing import Any
+
+import numpy as np
+import pamo_safe_project
 import torch
+import torchcumesh2sdf
+import trimesh
+from pdmc import DMC
 from torch import nn
 from torch.autograd import Function
-import trimesh
-import numpy
-from pdmc import DMC
-import time
-import torch.nn.functional as F
+
 from . import _C
-import numpy as np
-import trimesh
-import pamo_safe_project
-import torchcumesh2sdf
+
+try:
+    from ._cuda_abi import MIN_CUDA_CAPABILITY
+except ImportError:
+    MIN_CUDA_CAPABILITY = (8, 0)
+
+try:
+    __version__ = version("pamo")
+except PackageNotFoundError:
+    __version__ = "0.1.0"
+
+
+def _resolve_cuda_device(device: str | torch.device) -> torch.device:
+    resolved = torch.device(device)
+    if resolved.type != "cuda":
+        raise ValueError(f"PaMO requires a CUDA device, got {resolved}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("PaMO requires an available NVIDIA CUDA device")
+    if resolved.index is None:
+        resolved = torch.device("cuda", torch.cuda.current_device())
+    if resolved.index >= torch.cuda.device_count():
+        raise ValueError(
+            f"CUDA device {resolved.index} is unavailable; "
+            f"only {torch.cuda.device_count()} device(s) are visible"
+        )
+    capability = torch.cuda.get_device_capability(resolved)
+    if capability < MIN_CUDA_CAPABILITY:
+        raise RuntimeError(
+            "This internal PaMO wheel requires CUDA compute capability "
+            f"{MIN_CUDA_CAPABILITY[0]}.{MIN_CUDA_CAPABILITY[1]} or newer; "
+            f"device {resolved} reports {capability[0]}.{capability[1]}"
+        )
+    return resolved
 
 
 class PaMO(nn.Module):
-    def __init__(self, input_mesh, use_stage1 = True, use_stage3 = True):
-        super().__init__()
-        pamo = _C.CUDSP_Free()
+    """Run PaMO remeshing, simplification, and safe projection on one GPU."""
 
+    def __init__(
+        self,
+        input_mesh: trimesh.Trimesh,
+        use_stage1: bool = True,
+        use_stage3: bool = True,
+        device: str | torch.device = "cuda",
+        stage3_config: Any | None = None,
+    ) -> None:
+        super().__init__()
+        self.device = _resolve_cuda_device(device)
         self.use_stage1 = use_stage1
         self.use_stage3 = use_stage3
+        self._pamo = _C.CUDSP_Free()
 
-        print("Stage1 : ", self.use_stage1)
-        print("Stage3 : ", self.use_stage3)
-        
-        self.bbox = input_mesh.bounding_box.bounds
-        diameter = np.abs(self.bbox[1] - self.bbox[0]).max()
-        scale = 1.0 / diameter
+        bounds = np.asarray(input_mesh.bounding_box.bounds)
+        diameter = float(np.abs(bounds[1] - bounds[0]).max())
+        if not np.isfinite(diameter) or diameter <= 0.0:
+            raise ValueError("input_mesh must have a finite, non-zero bounding box")
+
+        self.bbox = bounds
         self.gt_mesh = copy.deepcopy(input_mesh)
-        
-        if self.use_stage3:
-            self.config = pamo_safe_project.config.Stage3Config()  # default config
-            self.system = pamo_safe_project.system.Stage3System(self.config)  # create a system (with all the cuda arrays)
+        self.config = stage3_config
+        self.system = None
+
+        self.vol2mesh = DMC(dtype=torch.float32) if self.use_stage1 else None
+        self.R = 256
+        self.band = 3 / self.R
+        self.margin = self.band * 2 + 1
+        self.target_faces: int | None = None
+
+        pamo_extension = self._pamo
 
         class DSPFunction(Function):
             @staticmethod
-            def forward(ctx, points, triangles, vertices_undo, num_vertices_undo, scale, threshold, is_stuck, init):
-                verts, faces, verts_occ, verts_map, verts_undo = pamo.forward(points, triangles, vertices_undo, num_vertices_undo, scale, threshold, is_stuck, init)
-                ctx.points = points
-                ctx.triangles = triangles
-                return verts, faces, verts_occ, verts_map, verts_undo
+            def forward(
+                ctx,
+                points,
+                triangles,
+                vertices_undo,
+                num_vertices_undo,
+                scale,
+                threshold,
+                is_stuck,
+                init,
+            ):
+                outputs = pamo_extension.forward(
+                    points,
+                    triangles,
+                    vertices_undo,
+                    num_vertices_undo,
+                    scale,
+                    threshold,
+                    is_stuck,
+                    init,
+                )
+                ctx.set_materialize_grads(False)
+                return outputs
 
         self.func = DSPFunction
-        # vol2mesh params
-        self.vol2mesh = DMC(dtype=torch.float32).cuda()
-        # mesh2vol params
-        self.R = 256
-        self.band = 3 / self.R # 3
-        self.margin = self.band * 2 + 1 #2
-        self.target_faces = None
 
-    def tri_area(self, v0, v1, v2):
-        cross_prod = torch.cross(v1 - v0, v2 - v0)
+    @staticmethod
+    def _stage3_config_for_mesh(
+        gt_vertices: int,
+        gt_faces: int,
+        stage2_vertices: int,
+        stage2_faces: int,
+    ):
+        """Size Stage 3 buffers for the mesh instead of upstream worst cases."""
+
+        def power_of_two_capacity(value: int, minimum: int) -> int:
+            return max(minimum, 1 << max(0, value - 1).bit_length())
+
+        config = pamo_safe_project.Stage3Config()
+        stage2_face_capacity = max(1, (stage2_faces - 1_024 + 1) // 2)
+        gt_face_capacity = max(1, (gt_faces - 1_024 + 1) // 2)
+        config.max_particles = power_of_two_capacity(
+            max(stage2_vertices, stage2_face_capacity), 1 << 10
+        )
+        config.max_gt_particles = power_of_two_capacity(
+            max(gt_vertices, gt_face_capacity), 1 << 10
+        )
+        config.max_gt_samples = min(config.max_gt_samples, 1 << 13)
+
+        # Collision buffers dominate Stage 3 memory. A one-million-block floor
+        # is ample for ordinary low-poly outputs while remaining practical on
+        # a 16 GiB RTX 4080. The existing overflow check still fails closed.
+        estimated_blocks = max(stage2_faces, stage2_vertices) * 256
+        config.max_blocks = power_of_two_capacity(estimated_blocks, 1 << 20)
+        config.max_blocks = min(config.max_blocks, 1 << 22)
+
+        return config
+
+    @staticmethod
+    def tri_area(v0: torch.Tensor, v1: torch.Tensor, v2: torch.Tensor) -> torch.Tensor:
+        cross_prod = torch.cross(v1 - v0, v2 - v0, dim=1)
         return 0.5 * torch.norm(cross_prod, dim=1)
 
-
-    def preprocess_mesh(self, points, triangles, band, margin):
-        tris = points[triangles]
-        tris = tris.cpu().numpy()
-        
+    @staticmethod
+    def preprocess_mesh(
+        points: torch.Tensor,
+        triangles: torch.Tensor,
+        band: float,
+        margin: float,
+    ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+        tris = points[triangles.long()].detach().cpu().numpy()
         tris_mean = tris.mean(axis=1).mean(axis=0)
         tris = tris - tris_mean
-        
-        tris_min = tris.min(0).min(0)
+        tris_min = tris.min(axis=0).min(axis=0)
         tris = tris - tris_min
-        tris_max = tris.max()
+        tris_max = float(tris.max())
+        if not np.isfinite(tris_max) or tris_max <= 0.0:
+            raise ValueError("input tensors must describe a finite, non-degenerate mesh")
         tris = (tris / tris_max + band) / margin
-        
         return tris, tris_min, tris_max, tris_mean
 
-    
-    def remesh(self, tris, tris_min, tris_max, tris_mean):
-        #print("preprocess start")
-        # tris, tris_min, tris_max, tris_mean = self.preprocess_mesh(points, triangles, self.band, self.margin)
-        
-        # tris = torch.tensor(tris, dtype=torch.float32, device='cuda:0')
-        # torch.cuda.synchronize()
-        
-        d = torchcumesh2sdf.get_sdf(tris, self.R, self.band)
-        d = d - 0.9 / self.R
-        
-        v, f = self.vol2mesh(d, return_quads=False) #Dual MC
+    def remesh(
+        self,
+        tris: torch.Tensor,
+        tris_min: np.ndarray,
+        tris_max: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.vol2mesh is None:
+            raise RuntimeError("Stage 1 is disabled")
 
-        v, f = v.cpu().numpy(), f.cpu().numpy()
-        v = (((v * self.R +0.5)/(self.R+1)* self.margin - self.band) * tris_max + tris_min)
-        
-        v = torch.from_numpy(v).float().cuda()
-        f = torch.from_numpy(f).int().cuda()
-        
-        return v, f
+        with torch.cuda.device(self.device):
+            distances = torchcumesh2sdf.get_sdf(tris, self.R, self.band)
+            distances = distances - 0.9 / self.R
+            vertices, faces = self.vol2mesh(distances, return_quads=False)
 
-    def run(self, points, triangles, ratio, tolerance=4, threshold=1e-3, iter=1000000, min_verts=10000000000):
-        
-        self.target_faces = max(int(ratio * len(triangles)), min_verts)
-        print("Target faces : {}".format(self.target_faces))
+        vertices_np = vertices.detach().cpu().numpy()
+        faces_np = faces.detach().cpu().numpy()
+        vertices_np = (
+            (vertices_np * self.R + 0.5) / (self.R + 1) * self.margin - self.band
+        ) * tris_max + tris_min
+        return (
+            torch.as_tensor(vertices_np, dtype=torch.float32, device=self.device),
+            torch.as_tensor(faces_np, dtype=torch.int32, device=self.device),
+        )
 
-        # scale the input mesh
-        tris, tris_min, tris_max, tris_mean = self.preprocess_mesh(points, triangles, self.band, self.margin)
-        tris = torch.tensor(tris, dtype=torch.float32, device='cuda:0')
+    def run(
+        self,
+        points: torch.Tensor,
+        triangles: torch.Tensor,
+        ratio: float,
+        tolerance: int = 4,
+        threshold: float = 1e-3,
+        iter: int = 1_000_000,
+        min_verts: int = 0,
+        stage3_iters: int = 5,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Optimize a mesh and return CPU NumPy vertex and face arrays.
 
-        # stage1 (Remeshing)
-        if self.use_stage1:
-            # Default 256
-            if self.target_faces <= 1000:
-                self.R = 128
-            if self.target_faces <= 50:
-                self.R = 64
+        ``min_verts`` is retained for upstream API compatibility. Upstream uses
+        it as a lower bound on the target face count.
+        """
+        if not 0.0 < ratio <= 1.0:
+            raise ValueError(f"ratio must be in (0, 1], got {ratio}")
+        if iter < 0 or tolerance < 0 or stage3_iters < 0 or min_verts < 0:
+            raise ValueError(
+                "iteration counts, tolerance, and min_verts must be non-negative"
+            )
 
-            start_stage1 = time.time()
-            verts, faces = self.remesh(tris, tris_min, tris_max, tris_mean)
-            end_stage1 = time.time()
-            print(f"Time for Remeshing: {end_stage1 - start_stage1} sec")
+        points = points.to(device=self.device, dtype=torch.float32).contiguous()
+        triangles = triangles.to(device=self.device, dtype=torch.int32).contiguous()
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(f"points must have shape (N, 3), got {tuple(points.shape)}")
+        if triangles.ndim != 2 or triangles.shape[1] != 3 or triangles.shape[0] == 0:
+            raise ValueError(
+                f"triangles must have non-empty shape (M, 3), got {tuple(triangles.shape)}"
+            )
+
+        self.target_faces = max(int(ratio * triangles.shape[0]), min_verts, 10)
+        if self.target_faces <= 50:
+            self.R = 64
+        elif self.target_faces <= 1_000:
+            self.R = 128
         else:
-            verts = points - torch.from_numpy(tris_mean).to(points.device)
-            faces = triangles
+            self.R = 256
+        self.band = 3 / self.R
+        self.margin = self.band * 2 + 1
 
-        # stage2 (Simplification)
-        start_stage2 =time.time()
-        verts_undo = torch.empty(0, dtype=torch.int32, device='cuda')
-        n_verts_undo = 0
-        count = 0
-        is_stuck = 0
-        scale = max(max(verts[:,0].max()-verts[:,0].min(), verts[:,1].max()-verts[:,1].min()), verts[:,2].max()-verts[:,2].min())
+        tris_np, tris_min, tris_max, tris_mean = self.preprocess_mesh(
+            points,
+            triangles,
+            self.band,
+            self.margin,
+        )
+        tris = torch.as_tensor(
+            tris_np, dtype=torch.float32, device=self.device
+        ).contiguous()
+
+        if self.use_stage1:
+            stage1_start = time.perf_counter()
+            vertices, faces = self.remesh(tris, tris_min, tris_max)
+            print(f"Time for Remeshing: {time.perf_counter() - stage1_start:.3f} sec")
+        else:
+            center = torch.as_tensor(tris_mean, dtype=torch.float32, device=self.device)
+            vertices = (points - center).contiguous()
+            faces = triangles.contiguous()
+
+        stage2_start = time.perf_counter()
+        vertices_undo = torch.empty(0, dtype=torch.int32, device=self.device)
+        n_vertices_undo = 0
+        unchanged_count = 0
+        is_stuck = False
         init = True
-        for it in range(iter):
-            num_faces_prev = faces.shape[0]
-            # Simplify
-            verts, faces, verts_occ, verts_map, verts_undo = self.func.apply(verts, faces, verts_undo, n_verts_undo, scale, threshold, is_stuck, init)
-            init = False
-            n_verts_undo = verts_undo.shape[0]
-            
-            # set verts and faces after 1 step of simplification
-            verts = verts[verts_occ.view(-1).bool()]
-            faces = faces[faces[:, 0] >= 0]
-            faces[:,0] = verts_map[faces[:,0].long()].view(-1)
-            faces[:,1] = verts_map[faces[:,1].long()].view(-1)
-            faces[:,2] = verts_map[faces[:,2].long()].view(-1)
-            
-            num_faces_current = faces.shape[0]
-            
-            if num_faces_current <= self.target_faces or num_faces_current <= 10:
-                break # simplified to target ratio
-            
-            if num_faces_current == num_faces_prev:
-                count += 1
-            else:
-                count = 0
-                is_stuck = 0
+        scale = float(
+            torch.max(
+                torch.max(vertices, dim=0).values - torch.min(vertices, dim=0).values
+            )
+        )
 
-            if count >= 2:
-                is_stuck = 1
-                
-            if count == tolerance:
-                print("Not enough edges available to be collapsed.")
-                break
-        
-        end_stage2 = time.time()
-        verts = verts.cpu().numpy()+ tris_mean
-        faces = faces.cpu().numpy()
-        print(f"Time for Simplification: {end_stage2 - start_stage2} sec")
-        
-        # stage3 (Safe projection)
-        if self.use_stage3 == True:
-            stage2_mesh = trimesh.Trimesh(vertices=verts, faces=faces)
-            verts, faces = pamo_safe_project.process(
+        with torch.cuda.device(self.device):
+            for _ in range(iter):
+                if faces.shape[0] <= self.target_faces or faces.shape[0] <= 10:
+                    break
+                previous_face_count = faces.shape[0]
+                vertices, faces, vertices_occ, vertices_map, vertices_undo = (
+                    self.func.apply(
+                        vertices,
+                        faces,
+                        vertices_undo,
+                        n_vertices_undo,
+                        scale,
+                        threshold,
+                        is_stuck,
+                        init,
+                    )
+                )
+                init = False
+                n_vertices_undo = vertices_undo.shape[0]
+
+                vertices = vertices[vertices_occ.view(-1).bool()].contiguous()
+                faces = faces[faces[:, 0] >= 0]
+                faces[:, 0] = vertices_map[faces[:, 0].long()].view(-1)
+                faces[:, 1] = vertices_map[faces[:, 1].long()].view(-1)
+                faces[:, 2] = vertices_map[faces[:, 2].long()].view(-1)
+                faces = faces.contiguous()
+
+                if faces.shape[0] == previous_face_count:
+                    unchanged_count += 1
+                else:
+                    unchanged_count = 0
+                    is_stuck = False
+                if unchanged_count >= 2:
+                    is_stuck = True
+                if unchanged_count >= tolerance:
+                    print("Not enough edges available to be collapsed.")
+                    break
+
+        vertices_np = vertices.detach().cpu().numpy() + tris_mean
+        faces_np = faces.detach().cpu().numpy()
+        print(f"Time for Simplification: {time.perf_counter() - stage2_start:.3f} sec")
+
+        if self.use_stage3:
+            stage2_mesh = trimesh.Trimesh(
+                vertices=vertices_np, faces=faces_np, process=False
+            )
+            if self.config is None:
+                self.config = self._stage3_config_for_mesh(
+                    len(self.gt_mesh.vertices),
+                    len(self.gt_mesh.faces),
+                    len(stage2_mesh.vertices),
+                    len(stage2_mesh.faces),
+                )
+            if self.system is None:
+                self.system = pamo_safe_project.Stage3System(
+                    self.config,
+                    str(self.device),
+                )
+            vertices_np, faces_np = pamo_safe_project.process(
                 self.gt_mesh.vertices,
                 self.gt_mesh.faces,
                 stage2_mesh.vertices,
                 stage2_mesh.faces,
-                5,
-                system=self.system,  # if provided, reuse the same system to avoid memory allocation
-                config=self.config,  # if system is not provided, use this config to create a new system
+                stage3_iters,
+                system=self.system,
+                config=self.config,
+                device=str(self.device),
             )
-            
-        return verts, faces
+
+        return np.asarray(vertices_np), np.asarray(faces_np)
 
 
 class PaSP(nn.Module):
-    def __init__(self):
+    """Run only PaMO's parallel simplification stage."""
+
+    def __init__(self, device: str | torch.device = "cuda") -> None:
         super().__init__()
-        sp = _C.CUDSP()
+        self.device = _resolve_cuda_device(device)
+        self._simplifier = _C.CUDSP()
 
-        class PaSPFunction(Function):
-            @staticmethod
-            def forward(ctx, points, triangles, scale, threshold, init):
-                verts, faces, verts_occ, verts_map = sp.forward(points, triangles, scale, threshold, init)
-                ctx.points = points
-                ctx.triangles = triangles
-                return verts, faces, verts_occ, verts_map
-
-        self.func = PaSPFunction
-
-    def run(self, points, triangles, threshold=0.001, iter=1000):
-        verts = points
-        faces = triangles
-        scale = max(max(verts[:,0].max()-verts[:,0].min(), verts[:,1].max()-verts[:,1].min()), verts[:,2].max()-verts[:,2].min())
+    def run(
+        self,
+        points: torch.Tensor,
+        triangles: torch.Tensor,
+        threshold: float = 0.001,
+        iter: int = 1_000,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        vertices = points.to(self.device, dtype=torch.float32).contiguous()
+        faces = triangles.to(self.device, dtype=torch.int32).contiguous()
+        scale = float(
+            torch.max(
+                torch.max(vertices, dim=0).values - torch.min(vertices, dim=0).values
+            )
+        )
         init = True
-        for it in range(iter):
-            # if it < 20:
-            #     t = threshold / (21 - it) * 2
-            # else:
-            #     t = threshold
-            # print(t)
-            num_faces = faces.shape[0]
-            verts, faces, verts_occ, verts_map = self.func.apply(verts, faces, scale, threshold, init)
-            verts = verts[verts_occ.view(-1).bool()]
-            faces = faces[faces[:, 0] >= 0]
-            faces[:,0] = verts_map[faces[:,0].long()].view(-1)
-            faces[:,1] = verts_map[faces[:,1].long()].view(-1)
-            faces[:,2] = verts_map[faces[:,2].long()].view(-1)
-            init = False
-            # if faces.shape[0] < 4500:
-            #     break
-            if faces.shape[0] == num_faces:
-                print("Converged at iteration {}".format(it))
-                break
 
-            # v = verts.cpu().numpy()
-            # f = faces.cpu().numpy()
-            # output_mesh = trimesh.Trimesh(vertices=v, faces=f)
-            # output_mesh.export('/home/sarahwei/code/simp_parallel/{}.obj'.format(it))
-
-        
-        return verts, faces
+        with torch.cuda.device(self.device):
+            for iteration in range(iter):
+                previous_face_count = faces.shape[0]
+                vertices, faces, vertices_occ, vertices_map = self._simplifier.forward(
+                    vertices,
+                    faces,
+                    scale,
+                    threshold,
+                    init,
+                )
+                vertices = vertices[vertices_occ.view(-1).bool()].contiguous()
+                faces = faces[faces[:, 0] >= 0]
+                faces[:, 0] = vertices_map[faces[:, 0].long()].view(-1)
+                faces[:, 1] = vertices_map[faces[:, 1].long()].view(-1)
+                faces[:, 2] = vertices_map[faces[:, 2].long()].view(-1)
+                faces = faces.contiguous()
+                init = False
+                if faces.shape[0] == previous_face_count:
+                    print(f"Converged at iteration {iteration}")
+                    break
+        return vertices, faces

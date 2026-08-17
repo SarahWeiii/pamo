@@ -7,43 +7,43 @@ from ..distance_kernels.distance_kernels_struct import *
 
 @wp.func
 def compute_b(d: float, d_hat: float):
-    return wp.select(d >= d_hat, -(d - d_hat) * (d - d_hat) * wp.log(d / d_hat), 0.0)
+    return wp.where(d >= d_hat, 0.0, -(d - d_hat) * (d - d_hat) * wp.log(d / d_hat))
 
 
 @wp.func
 def compute_db_dd(d: float, d_hat: float):
     t = d - d_hat
-    return wp.select(d >= d_hat, -2.0 * t * wp.log(d / d_hat) - t * t / d, 0.0)
+    return wp.where(d >= d_hat, 0.0, -2.0 * t * wp.log(d / d_hat) - t * t / d)
 
 
 @wp.func
 def compute_d2b_dd2(d: float, d_hat: float):
-    return wp.select(
+    return wp.where(
         d >= d_hat,
+        0.0,
         -2.0 * wp.log(d / d_hat)
         - 2.0 * (d - d_hat) / d
         - 1.0
         + (d_hat * d_hat) / (d * d),
-        0.0,
     )
 
 
 @wp.func
 def compute_e(c: float, eps_cross: float):
     t = c / eps_cross
-    return wp.select(c < eps_cross, 1.0, -1.0 * t * t + 2.0 * t)
+    return wp.where(c < eps_cross, -1.0 * t * t + 2.0 * t, 1.0)
 
 
 @wp.func
 def compute_de_dc(c: float, eps_cross: float):
-    return wp.select(
-        c < eps_cross, 0.0, -2.0 * c / (eps_cross * eps_cross) + 2.0 / eps_cross
+    return wp.where(
+        c < eps_cross, -2.0 * c / (eps_cross * eps_cross) + 2.0 / eps_cross, 0.0
     )
 
 
 @wp.func
 def compute_d2e_dc2(c: float, eps_cross: float):
-    return wp.select(c < eps_cross, 0.0, -2.0 / (eps_cross * eps_cross))
+    return wp.where(c < eps_cross, -2.0 / (eps_cross * eps_cross), 0.0)
 
 
 @wp.kernel
